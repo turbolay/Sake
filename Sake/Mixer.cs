@@ -19,16 +19,19 @@ namespace Sake
         /// <param name="feeRate">Bitcoin network fee rate the coinjoin is targeting.</param>
         /// <param name="minAllowedOutputAmount">Minimum output amount that's allowed to be registered.</param>
         /// <param name="maxAllowedOutputAmount">Miximum output amount that's allowed to be registered.</param>
-        /// <param name="inputSize">Size of an input.</param>
-        /// <param name="outputSize">Size of an output.</param>
-        public Mixer(FeeRate feeRate, Money minAllowedOutputAmount, Money maxAllowedOutputAmount, bool isTaprootAllowed, Random? random = null)
+        /// <param name="allowedOutputTypes">Script types allowed as outputs.</param>
+        /// <param name="random">Random numbers generator.</param>
+        public Mixer(FeeRate feeRate, Money minAllowedOutputAmount, Money maxAllowedOutputAmount, IEnumerable<ScriptType> allowedOutputTypes, Random? random = null)
         {
             FeeRate = feeRate;
-            IsTaprootAllowed = isTaprootAllowed;
-            MinAllowedOutputAmount = minAllowedOutputAmount;
+            AllowedOutputTypes = allowedOutputTypes;
+            var minEconomicalOutput = FeeRate.GetFee(
+                Math.Max(
+                    ScriptType.P2WPKH.EstimateInputVsize() + ScriptType.P2WPKH.EstimateOutputVsize(),
+                    ScriptType.Taproot.EstimateInputVsize() + ScriptType.Taproot.EstimateOutputVsize()));
+            MinAllowedOutputAmount = Math.Max(minEconomicalOutput, minAllowedOutputAmount);
             MaxAllowedOutputAmount = maxAllowedOutputAmount;
             Random = random ?? Random.Shared;
-
 
             // Create many standard denominations.
             Denominations = CreateDenominations();
@@ -37,13 +40,12 @@ namespace Sake
 
         public ScriptType ChangeScriptType { get; }
         public Money ChangeFee => FeeRate.GetFee(ChangeScriptType.EstimateOutputVsize());
-
         public Money MinAllowedOutputAmount { get; }
         public Money MaxAllowedOutputAmount { get; }
         private Random Random { get; }
 
         public FeeRate FeeRate { get; }
-        public bool IsTaprootAllowed { get; }
+        public IEnumerable<ScriptType> AllowedOutputTypes { get; }
         public int InputSize { get; } = 69;
         public int OutputSize { get; } = 33;
         public List<int> Leftovers { get; } = new();
@@ -221,7 +223,7 @@ namespace Sake
             var myInputs = myInputsParam.ToArray();
             var myInputSum = myInputs.Sum();
             var smallestScriptType = Math.Min(ScriptType.P2WPKH.EstimateOutputVsize(), ScriptType.Taproot.EstimateOutputVsize());
-            var maxNumberOfOutputsAllowed = Math.Min(availableVsize / smallestScriptType, 8); // The absolute max possible with the smallest script type.
+            var maxNumberOfOutputsAllowed = Math.Min(availableVsize / smallestScriptType, 10); // The absolute max possible with the smallest script type.
 
             var setCandidates = new Dictionary<int, (IEnumerable<Output> Decomp, Money Cost)>();
 
@@ -292,12 +294,12 @@ namespace Sake
             var finalCandidate = finalCandidates.Where(x => x.Decomp.First() == largestAmount).RandomElement(Random).Decomp;
 
             // Sanity check
-             var totalOutputAmount = Money.Satoshis(finalCandidate.Sum(x => x.EffectiveCost));
+            var totalOutputAmount = Money.Satoshis(finalCandidate.Sum(x => x.EffectiveCost));
             if (totalOutputAmount > myInputSum)
             {
                 throw new InvalidOperationException("The decomposer is creating money. Aborting.");
             }
-            if (totalOutputAmount + MinAllowedOutputAmount + ChangeFee < myInputSum)
+            if (totalOutputAmount + MinAllowedOutputAmount < myInputSum)
             {
                 throw new InvalidOperationException("The decomposer is losing money. Aborting.");
             }
@@ -309,7 +311,7 @@ namespace Sake
             }
 
             var leftover = myInputSum - totalOutputAmount;
-            if (leftover > MinAllowedOutputAmount + FeeRate.GetFee(NBitcoinExtensions.P2trOutputVirtualSize))
+            if (leftover > MinAllowedOutputAmount)
             {
                 throw new NotSupportedException($"Leftover too large. Aborting to avoid money loss: {leftover}");
             }
@@ -335,8 +337,8 @@ namespace Sake
             {
                 foreach (var (sum, count, decomp) in Decomposer.Decompose(
                     target: (long)myInputSum,
-                    tolerance: MinAllowedOutputAmount + ChangeFee,
-                    maxCount: maxNumberOfOutputsAllowed,
+                    tolerance: MinAllowedOutputAmount,
+                    maxCount: Math.Min(maxNumberOfOutputsAllowed, 8), // Decomposer doesn't do more than 8.
                     stdDenoms: stdDenoms))
                 {
                     var currentSet = Decomposer.ToRealValuesArray(
@@ -358,14 +360,8 @@ namespace Sake
                         continue;
                     }
 
-                    HashCode hash = new();
-                    foreach (var item in finalDenoms.OrderBy(x => x.Amount))
-                    {
-                        hash.Add(item);
-                    }
-
                     var deficit = (myInputSum - (ulong)finalDenoms.Sum(d => d.EffectiveCost)) + CalculateCost(finalDenoms);
-                    setCandidates.TryAdd(hash.ToHashCode(), (finalDenoms, deficit));
+                    setCandidates.TryAdd(CalculateHash(finalDenoms), (finalDenoms, deficit));
                 }
             }
 
@@ -386,8 +382,11 @@ namespace Sake
                     var denom = denoms.Where(x => x.EffectiveCost <= remaining && x.EffectiveCost >= (remaining / 3)).RandomElement(Random)
                         ?? denoms.FirstOrDefault(x => x.EffectiveCost <= remaining);
 
-                    // We can only let this go forward if at least 2 outputs can be added (denom + potential change)
-                    if (denom is null || remaining < MinAllowedOutputAmount + ChangeFee || remainingVsize < denom.ScriptType.EstimateOutputVsize() + ChangeScriptType.EstimateOutputVsize())
+                    // Continue only if there is enough remaining amount and size to create one output (+ change if change could potentially be created).
+                    // There can be change only if the remaining is at least the current denom effective cost + the minimum change effective cost.
+                    if (denom is null ||
+                        (remaining < denom.EffectiveCost + MinAllowedOutputAmount + ChangeFee && remainingVsize < denom.ScriptType.EstimateOutputVsize()) ||
+                        (remaining >= denom.EffectiveCost + MinAllowedOutputAmount + ChangeFee && remainingVsize < denom.ScriptType.EstimateOutputVsize() + ChangeScriptType.EstimateOutputVsize()))
                     {
                         break;
                     }
@@ -404,7 +403,7 @@ namespace Sake
                 }
 
                 var loss = Money.Zero;
-                if (remaining >= MinAllowedOutputAmount + ChangeFee)
+                if (remaining >= MinAllowedOutputAmount)
                 {
                     var change = Output.FromAmount(remaining, ChangeScriptType, FeeRate);
                     currentSet.Add(change);
@@ -422,14 +421,8 @@ namespace Sake
                     currentSet.Add(change);
                 }
 
-                HashCode h = new();
-                foreach (var item in currentSet.OrderBy(x => x.Amount))
-                {
-                    h.Add(item);
-                }
-
                 setCandidates.TryAdd(
-                    h.ToHashCode(), // Create hash to ensure uniqueness.
+                    CalculateHash(currentSet), // Create hash to ensure uniqueness.
                     (currentSet, loss + CalculateCost(currentSet)));
             }
 
@@ -447,8 +440,10 @@ namespace Sake
                 bool end = false;
                 while (denom.EffectiveCost <= remaining)
                 {
-                    // We can only let this go forward if at least 2 output can be added (denom + potential change)
-                    if (remaining < MinAllowedOutputAmount + ChangeFee || remainingVsize < denom.ScriptType.EstimateOutputVsize() + ChangeScriptType.EstimateOutputVsize())
+                    // Continue only if there is enough remaining amount and size to create one output + change (if change will potentially be created).
+                    // There can be change only if the remaining is at least the current denom effective cost + the minimum change effective cost.
+                    if ((remaining < denom.EffectiveCost + MinAllowedOutputAmount + ChangeFee && remainingVsize < denom.ScriptType.EstimateOutputVsize()) ||
+                        (remaining >= denom.EffectiveCost + MinAllowedOutputAmount + ChangeFee && remainingVsize < denom.ScriptType.EstimateOutputVsize() + ChangeScriptType.EstimateOutputVsize()))
                     {
                         end = true;
                         break;
@@ -473,7 +468,7 @@ namespace Sake
             }
 
             var loss = Money.Zero;
-            if (remaining >= MinAllowedOutputAmount + ChangeFee)
+            if (remaining >= MinAllowedOutputAmount)
             {
                 var change = Output.FromAmount(remaining, ChangeScriptType, FeeRate);
                 naiveSet.Add(change);
@@ -491,13 +486,7 @@ namespace Sake
                 naiveSet.Add(change);
             }
 
-            HashCode hash = new();
-            foreach (var item in naiveSet.OrderBy(x => x.Amount))
-            {
-                hash.Add(item);
-            }
-
-            return KeyValuePair.Create(hash.ToHashCode(), ((IEnumerable<Output>)naiveSet, loss + CalculateCost(naiveSet)));
+            return KeyValuePair.Create(CalculateHash(naiveSet), ((IEnumerable<Output>)naiveSet, loss + CalculateCost(naiveSet)));
         }
 
         private IEnumerable<Output> GetFilteredDenominations(IEnumerable<ulong> inputs)
@@ -556,7 +545,7 @@ namespace Sake
 
             foreach (var denom in denominations)
             {
-                if (denom.Amount < MinAllowedOutputAmount || remaining < MinAllowedOutputAmount + ChangeFee)
+                if (denom.Amount < MinAllowedOutputAmount || remaining < MinAllowedOutputAmount)
                 {
                     break;
                 }
@@ -568,7 +557,7 @@ namespace Sake
                 }
             }
 
-            if (remaining >= MinAllowedOutputAmount + ChangeFee)
+            if (remaining >= MinAllowedOutputAmount)
             {
                 var changeOutput = Output.FromAmount(remaining, ScriptType.P2WPKH, FeeRate);
                 yield return changeOutput;
@@ -588,17 +577,22 @@ namespace Sake
 
         private ScriptType GetNextScriptType()
         {
-            return GetNextScriptType(IsTaprootAllowed, Random);
+            return GetNextScriptType(AllowedOutputTypes, Random);
         }
 
-        public static ScriptType GetNextScriptType(bool isTaprootAllowed, Random random)
+        public static ScriptType GetNextScriptType(IEnumerable<ScriptType> allowedOutputTypes, Random random)
         {
-            if (!isTaprootAllowed)
-            {
-                return ScriptType.P2WPKH;
-            }
+            return allowedOutputTypes.RandomElement(random);
+        }
 
-            return random.NextDouble() < 0.5 ? ScriptType.P2WPKH : ScriptType.Taproot;
+        private int CalculateHash(IEnumerable<Output> outputs)
+        {
+            HashCode hash = new();
+            foreach (var item in outputs.OrderBy(x => x.EffectiveCost))
+            {
+                hash.Add(item.Amount);
+            }
+            return hash.ToHashCode();
         }
     }
 }
